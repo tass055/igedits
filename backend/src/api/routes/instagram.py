@@ -53,6 +53,11 @@ class CredentialsRequest(BaseModel):
     password: str = Field(min_length=1, max_length=255)
 
 
+class SessionIdRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=255)
+    session_id: str = Field(min_length=1, max_length=512)
+
+
 # ---------------------------------------------------------------------------
 # Status / config endpoints
 # ---------------------------------------------------------------------------
@@ -102,6 +107,23 @@ async def save_credentials(
     return {"status": "saved", "username": body.username}
 
 
+@router.post("/credentials/session-id")
+async def save_session_id_credentials(
+    body: SessionIdRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    user_id = _get_user_id(request)
+    config = get_config()
+    if not config.backend_auth_secret:
+        raise HTTPException(status_code=500, detail="BACKEND_AUTH_SECRET is not configured")
+
+    await instagram_service.save_session_id(
+        db, user_id, body.username, body.session_id, config.backend_auth_secret
+    )
+    return {"status": "saved", "username": body.username, "auth_method": "session_id"}
+
+
 @router.get("/credentials")
 async def get_credentials(request: Request, db: AsyncSession = Depends(get_db)):
     user_id = _get_user_id(request)
@@ -114,7 +136,11 @@ async def get_credentials(request: Request, db: AsyncSession = Depends(get_db)):
     )
     if not creds:
         return {"connected": False}
-    return {"connected": True, "username": creds["username"]}
+    return {
+        "connected": True,
+        "username": creds["username"],
+        "auth_method": creds.get("auth_method", "password"),
+    }
 
 
 @router.delete("/credentials")

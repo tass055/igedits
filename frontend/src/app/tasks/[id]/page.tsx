@@ -141,6 +141,7 @@ export default function TaskPage() {
     Array<{ id: string; name: string; description: string; animation: string }>
   >([]);
   const [instagramEnabled, setInstagramEnabled] = useState(false);
+  const [instagramMethod, setInstagramMethod] = useState<"make" | "direct" | null>(null);
   const hasTriggeredAutoRefresh = useRef(false);
 
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -280,6 +281,7 @@ export default function TaskPage() {
         if (res.ok) {
           const data = await res.json();
           setInstagramEnabled(Boolean(data.connected));
+          setInstagramMethod(data.method ?? null);
         }
       } catch {
         // Instagram not available — silently skip
@@ -1228,7 +1230,7 @@ export default function TaskPage() {
                           Export
                         </Button>
                         {instagramEnabled && (
-                          <PublishToInstagramModal clipId={clip.id} />
+                          <PublishToInstagramModal clipId={clip.id} method={instagramMethod} />
                         )}
                         <Select value={exportPreset} onValueChange={setExportPreset}>
                           <SelectTrigger className="h-8 w-28">

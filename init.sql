@@ -162,34 +162,16 @@ CREATE TABLE stripe_webhook_events (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Instagram (Meta Graph API) connected accounts
-CREATE TABLE instagram_accounts (
-    id VARCHAR(36) PRIMARY KEY DEFAULT uuid_generate_v4()::text,
-    user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    ig_user_id VARCHAR(64) NOT NULL,
-    ig_username VARCHAR(255),
-    fb_page_id VARCHAR(64) NOT NULL,
-    fb_page_name VARCHAR(255),
-    access_token TEXT NOT NULL,
-    token_expires_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (user_id, ig_user_id)
-);
-
-CREATE TABLE instagram_publishes (
-    id VARCHAR(36) PRIMARY KEY DEFAULT uuid_generate_v4()::text,
-    user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    clip_id VARCHAR(36) NOT NULL REFERENCES generated_clips(id) ON DELETE CASCADE,
-    ig_account_id VARCHAR(36) NOT NULL REFERENCES instagram_accounts(id) ON DELETE CASCADE,
-    caption TEXT,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    container_id VARCHAR(64),
-    ig_media_id VARCHAR(64),
-    permalink VARCHAR(500),
-    error TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+-- Instagram direct posting credentials (instagrapi — unofficial API)
+CREATE TABLE instagram_credentials (
+    user_id        VARCHAR(36) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    username       VARCHAR(255) NOT NULL,
+    enc_password   TEXT,                    -- Fernet-encrypted password (auth_method = 'password')
+    enc_session_id TEXT,                    -- Fernet-encrypted browser sessionid cookie (auth_method = 'session_id')
+    enc_session    TEXT,                    -- Fernet-encrypted instagrapi session JSON (reused across logins)
+    auth_method    VARCHAR(20) NOT NULL DEFAULT 'password',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Create indexes for better performance
@@ -205,10 +187,7 @@ CREATE INDEX idx_processing_cache_source_url ON processing_cache(source_url);
 CREATE INDEX idx_generated_clips_task_id ON generated_clips(task_id);
 CREATE INDEX idx_generated_clips_clip_order ON generated_clips(clip_order);
 CREATE INDEX idx_generated_clips_created_at ON generated_clips(created_at);
-CREATE INDEX idx_instagram_accounts_user_id ON instagram_accounts(user_id);
-CREATE INDEX idx_instagram_publishes_user_id ON instagram_publishes(user_id);
-CREATE INDEX idx_instagram_publishes_clip_id ON instagram_publishes(clip_id);
-CREATE INDEX idx_instagram_publishes_status ON instagram_publishes(status);
+CREATE INDEX idx_instagram_credentials_user_id ON instagram_credentials(user_id);
 CREATE INDEX idx_session_token ON session(token);
 CREATE INDEX idx_session_userId ON session("userId");
 CREATE INDEX idx_account_userId ON account("userId");
@@ -241,8 +220,7 @@ CREATE TRIGGER update_tasks_updated_at BEFORE UPDATE ON tasks FOR EACH ROW EXECU
 CREATE TRIGGER update_sources_updated_at BEFORE UPDATE ON sources FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_generated_clips_updated_at BEFORE UPDATE ON generated_clips FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_instagram_accounts_updated_at BEFORE UPDATE ON instagram_accounts FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-CREATE TRIGGER update_instagram_publishes_updated_at BEFORE UPDATE ON instagram_publishes FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_instagram_credentials_updated_at BEFORE UPDATE ON instagram_credentials FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Better Auth tables use camelCase "updatedAt"
 CREATE TRIGGER update_session_updatedAt BEFORE UPDATE ON session FOR EACH ROW EXECUTE FUNCTION update_updatedAt_column();

@@ -11,6 +11,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from cryptography.fernet import Fernet
 from sqlalchemy import text
@@ -54,16 +55,47 @@ async def save_credentials(
     await db.execute(
         text(
             """
-            INSERT INTO instagram_credentials (user_id, username, enc_password, enc_session, updated_at)
-            VALUES (:user_id, :username, :enc_password, NULL, CURRENT_TIMESTAMP)
+            INSERT INTO instagram_credentials (user_id, username, enc_password, enc_session_id, enc_session, auth_method, updated_at)
+            VALUES (:user_id, :username, :enc_password, NULL, NULL, 'password', CURRENT_TIMESTAMP)
             ON CONFLICT (user_id) DO UPDATE
-                SET username     = EXCLUDED.username,
-                    enc_password = EXCLUDED.enc_password,
-                    enc_session  = NULL,
-                    updated_at   = CURRENT_TIMESTAMP
+                SET username      = EXCLUDED.username,
+                    enc_password  = EXCLUDED.enc_password,
+                    enc_session_id = NULL,
+                    enc_session   = NULL,
+                    auth_method   = 'password',
+                    updated_at    = CURRENT_TIMESTAMP
             """
         ),
         {"user_id": user_id, "username": username, "enc_password": enc_password},
+    )
+    await db.commit()
+
+
+async def save_session_id(
+    db: AsyncSession,
+    user_id: str,
+    username: str,
+    session_id: str,
+    backend_auth_secret: str,
+) -> None:
+    fernet = _make_fernet(backend_auth_secret)
+    enc_session_id = _encrypt(fernet, unquote(session_id))
+
+    await db.execute(
+        text(
+            """
+            INSERT INTO instagram_credentials (user_id, username, enc_password, enc_session_id, enc_session, auth_method, updated_at)
+            VALUES (:user_id, :username, NULL, :enc_session_id, NULL, 'session_id', CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id) DO UPDATE
+                SET username       = EXCLUDED.username,
+                    enc_password   = NULL,
+                    enc_session_id = EXCLUDED.enc_session_id,
+                    enc_session    = NULL,
+                    auth_method    = 'session_id',
+                    updated_at     = CURRENT_TIMESTAMP
+            """
+        ),
+        {"user_id": user_id, "username": username, "enc_session_id": enc_session_id},
     )
     await db.commit()
 
@@ -75,7 +107,7 @@ async def get_credentials(
 ) -> dict[str, Any] | None:
     result = await db.execute(
         text(
-            "SELECT username, enc_password, enc_session FROM instagram_credentials WHERE user_id = :user_id"
+            "SELECT username, enc_password, enc_session, enc_session_id, auth_method FROM instagram_credentials WHERE user_id = :user_id"
         ),
         {"user_id": user_id},
     )
@@ -86,8 +118,10 @@ async def get_credentials(
     fernet = _make_fernet(backend_auth_secret)
     return {
         "username": row.username,
-        "password": _decrypt(fernet, row.enc_password),
+        "password": _decrypt(fernet, row.enc_password) if row.enc_password else None,
         "session": _decrypt(fernet, row.enc_session) if row.enc_session else None,
+        "session_id": _decrypt(fernet, row.enc_session_id) if row.enc_session_id else None,
+        "auth_method": row.auth_method or "password",
     }
 
 
@@ -133,6 +167,11 @@ async def post_reel(
         LoginRequired,
         TwoFactorRequired,
         ChallengeRequired,
+        SelectContactPointRecoveryForm,
+        RecaptchaChallengeForm,
+        SubmitPhoneNumberForm,
+        BadPassword,
+        ClientError,
     )
 
     creds = await get_credentials(db, user_id, backend_auth_secret)
@@ -143,31 +182,58 @@ async def post_reel(
         raise FileNotFoundError(f"Clip file not found: {clip_path}")
 
     cl = Client()
-
-    def _login_fresh() -> None:
-        logger.info("Instagram: fresh login for user %s", user_id)
-        cl.login(creds["username"], creds["password"])
+    auth_method = creds.get("auth_method", "password")
 
     try:
-        if creds["session"]:
-            cl.load_settings(json.loads(creds["session"]))
-            try:
-                cl.login(creds["username"], creds["password"])
-            except LoginRequired:
-                cl = Client()
-                _login_fresh()
+        if auth_method == "session_id" and creds.get("session_id"):
+            logger.info("Instagram: session ID login for user %s", user_id)
+            cl.login_by_sessionid(unquote(creds["session_id"]))
         else:
-            _login_fresh()
+            def _login_fresh() -> None:
+                logger.info("Instagram: fresh login for user %s", user_id)
+                cl.login(creds["username"], creds["password"])
+
+            if creds["session"]:
+                cl.load_settings(json.loads(creds["session"]))
+                try:
+                    cl.login(creds["username"], creds["password"])
+                except LoginRequired:
+                    cl = Client()
+                    _login_fresh()
+            else:
+                _login_fresh()
     except TwoFactorRequired:
         raise ValueError(
             "Two-factor authentication is enabled on this Instagram account. "
             "Disable 2FA or use a secondary account without 2FA."
         )
-    except ChallengeRequired:
+    except BadPassword:
         raise ValueError(
-            "Instagram requires account verification. "
-            "Open Instagram on your phone, complete the security check, then try again."
+            "Incorrect Instagram password. Update your credentials in Settings → Integrations."
         )
+    except (ChallengeRequired, SelectContactPointRecoveryForm, RecaptchaChallengeForm, SubmitPhoneNumberForm):
+        raise ValueError(
+            "Instagram blocked the login from this server's IP address. "
+            "Check your email for a security alert from Instagram and click 'This was me' to approve it, "
+            "then try posting again. If the issue persists, log in to instagram.com from this machine's browser first."
+        )
+    except ClientError as e:
+        logger.error("Instagram API blocked (%s) for user %s: %s", auth_method, user_id, e)
+        raise ValueError(
+            "Instagram is blocking API requests from this server's IP address. "
+            "Your credentials are valid, but Instagram rejects connections from this IP. "
+            "Set INSTAGRAM_PROXY_URL in your .env to route through a residential proxy, "
+            "or use Make.com instead (Settings → Integrations)."
+        )
+    except (LoginRequired, Exception) as e:
+        logger.error("Instagram login failed (%s) for user %s: %s: %s", auth_method, user_id, type(e).__name__, e)
+        if auth_method == "session_id":
+            raise ValueError(
+                "Instagram session ID has expired or is invalid. "
+                "Get a new one from your browser DevTools (instagram.com → F12 → Application → Cookies → sessionid) "
+                "and reconnect in Settings → Integrations."
+            )
+        raise
 
     # Persist the session so we avoid a full re-login next time
     session_json = json.dumps(cl.get_settings())

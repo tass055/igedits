@@ -14,6 +14,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 interface CredentialsStatus {
   connected: boolean;
   username?: string;
+  auth_method?: "password" | "session_id";
 }
 
 export default function IntegrationsPage() {
@@ -22,8 +23,10 @@ export default function IntegrationsPage() {
   const [credStatus, setCredStatus] = useState<CredentialsStatus | null>(null);
   const [credLoading, setCredLoading] = useState(true);
 
+  const [connectMethod, setConnectMethod] = useState<"password" | "session_id">("password");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [sessionId, setSessionId] = useState("");
   const [saving, setSaving] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -44,19 +47,29 @@ export default function IntegrationsPage() {
     setSuccess(false);
     setSaving(true);
     try {
-      const res = await fetch("/api/instagram/credentials", {
+      const endpoint =
+        connectMethod === "session_id"
+          ? "/api/instagram/credentials/session-id"
+          : "/api/instagram/credentials";
+      const body =
+        connectMethod === "session_id"
+          ? { username, session_id: sessionId }
+          : { username, password };
+
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       if (!res.ok) {
         setError(data.error || data.detail || "Failed to save credentials");
       } else {
-        setCredStatus({ connected: true, username: data.username });
+        setCredStatus({ connected: true, username: data.username, auth_method: data.auth_method });
         setSuccess(true);
         setUsername("");
         setPassword("");
+        setSessionId("");
       }
     } catch {
       setError("Network error — please try again");
@@ -128,6 +141,9 @@ export default function IntegrationsPage() {
               <div className="flex items-center gap-2 text-sm font-medium">
                 <CheckCircle2 className="w-4 h-4 text-green-500" />
                 Connected as <span className="font-semibold">@{credStatus.username}</span>
+                <span className="text-xs text-muted-foreground font-normal">
+                  ({credStatus.auth_method === "session_id" ? "session ID" : "password"})
+                </span>
               </div>
               <Button
                 variant="outline"
@@ -140,46 +156,95 @@ export default function IntegrationsPage() {
               </Button>
             </div>
           ) : (
-            <form onSubmit={handleConnect} className="space-y-3 max-w-sm">
-              <div className="space-y-1">
-                <Label htmlFor="ig-username">Instagram username</Label>
-                <Input
-                  id="ig-username"
-                  placeholder="yourusername"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  autoComplete="username"
-                  required
-                />
+            <div className="max-w-sm space-y-4">
+              {/* Method toggle */}
+              <div className="flex gap-1 p-1 bg-muted rounded-md w-fit">
+                <button
+                  type="button"
+                  onClick={() => { setConnectMethod("password"); setError(null); }}
+                  className={`px-3 py-1 text-sm rounded-sm transition-colors ${
+                    connectMethod === "password"
+                      ? "bg-background shadow-sm font-medium"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  Username & Password
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setConnectMethod("session_id"); setError(null); }}
+                  className={`px-3 py-1 text-sm rounded-sm transition-colors ${
+                    connectMethod === "session_id"
+                      ? "bg-background shadow-sm font-medium"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  Session ID
+                </button>
               </div>
-              <div className="space-y-1">
-                <Label htmlFor="ig-password">Password</Label>
-                <Input
-                  id="ig-password"
-                  type="password"
-                  placeholder="••••••••"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  autoComplete="current-password"
-                  required
-                />
-              </div>
-              {error && <p className="text-sm text-destructive">{error}</p>}
-              {success && (
-                <p className="text-sm text-green-600 flex items-center gap-1">
-                  <CheckCircle2 className="w-4 h-4" /> Connected successfully
+
+              <form onSubmit={handleConnect} className="space-y-3">
+                <div className="space-y-1">
+                  <Label htmlFor="ig-username">Instagram username</Label>
+                  <Input
+                    id="ig-username"
+                    placeholder="yourusername"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    autoComplete="username"
+                    required
+                  />
+                </div>
+
+                {connectMethod === "password" ? (
+                  <div className="space-y-1">
+                    <Label htmlFor="ig-password">Password</Label>
+                    <Input
+                      id="ig-password"
+                      type="password"
+                      placeholder="••••••••"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      autoComplete="current-password"
+                      required
+                    />
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    <Label htmlFor="ig-session-id">Session ID</Label>
+                    <Input
+                      id="ig-session-id"
+                      type="password"
+                      placeholder="Paste your sessionid cookie value"
+                      value={sessionId}
+                      onChange={(e) => setSessionId(e.target.value)}
+                      required
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Open instagram.com (while logged in) → F12 → Application → Cookies →
+                      https://www.instagram.com → find <code className="bg-muted px-1 rounded">sessionid</code> → copy its value.
+                      Bypasses IP-based login blocks.
+                    </p>
+                  </div>
+                )}
+
+                {error && <p className="text-sm text-destructive">{error}</p>}
+                {success && (
+                  <p className="text-sm text-green-600 flex items-center gap-1">
+                    <CheckCircle2 className="w-4 h-4" /> Connected successfully
+                  </p>
+                )}
+                <Button type="submit" disabled={saving}>
+                  {saving ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+                  Connect
+                </Button>
+                <p className="text-xs text-muted-foreground pt-1">
+                  Credentials are encrypted and stored on your server. This uses an unofficial
+                  Instagram API — not affiliated with Meta. Accounts with two-factor authentication
+                  are not supported.
                 </p>
-              )}
-              <Button type="submit" disabled={saving}>
-                {saving ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
-                Connect
-              </Button>
-              <p className="text-xs text-muted-foreground pt-1">
-                Credentials are encrypted and stored on your server. This uses an unofficial
-                Instagram API — not affiliated with Meta. Accounts with two-factor authentication
-                are not supported.
-              </p>
-            </form>
+              </form>
+            </div>
           )}
         </div>
 

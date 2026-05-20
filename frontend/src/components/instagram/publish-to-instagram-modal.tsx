@@ -16,9 +16,10 @@ import { Loader2, Instagram, CheckCircle2, Sparkles } from "lucide-react";
 
 interface PublishToInstagramModalProps {
   clipId: string;
+  method?: "make" | "direct" | null;
 }
 
-export function PublishToInstagramModal({ clipId }: PublishToInstagramModalProps) {
+export function PublishToInstagramModal({ clipId, method }: PublishToInstagramModalProps) {
   const [open, setOpen] = useState(false);
   const [caption, setCaption] = useState("");
   const [sent, setSent] = useState(false);
@@ -62,7 +63,7 @@ export function PublishToInstagramModal({ clipId }: PublishToInstagramModalProps
       if (!res.ok) throw new Error(data.detail || "Failed to publish");
       setSent(true);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to send to Make.com");
+      setError(e instanceof Error ? e.message : "Failed to publish to Instagram");
     } finally {
       setLoading(false);
     }
@@ -80,7 +81,9 @@ export function PublishToInstagramModal({ clipId }: PublishToInstagramModalProps
         <DialogHeader>
           <DialogTitle>Publish to Instagram Reels</DialogTitle>
           <DialogDescription>
-            Sends the clip to your Make.com scenario for posting.
+            {method === "direct"
+              ? "Posts the clip directly to your connected Instagram account."
+              : "Sends the clip to your Make.com scenario for posting."}
           </DialogDescription>
         </DialogHeader>
 
@@ -89,7 +92,9 @@ export function PublishToInstagramModal({ clipId }: PublishToInstagramModalProps
             <Alert className="border-green-200 bg-green-50">
               <CheckCircle2 className="h-4 w-4 text-green-600" />
               <AlertDescription className="text-green-800">
-                Sent! Your clip is being posted — check Instagram in about 30 seconds.
+                {method === "direct"
+                  ? "Posted! Your Reel should appear on Instagram shortly."
+                  : "Sent! Your clip is being posted — check Instagram in about 30 seconds."}
               </AlertDescription>
             </Alert>
             <Button
