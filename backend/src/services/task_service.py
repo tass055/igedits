@@ -3,7 +3,7 @@ Task service - orchestrates task creation and processing workflow.
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +30,7 @@ from ..clip_editor import (
     overlay_custom_captions,
 )
 from ..video_utils import parse_timestamp_to_seconds
+from ..broll import fetch_broll_for_opportunities
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,17 @@ class TaskService:
                     analysis_json=None,
                 )
 
+            # B-roll is active only when the task requested it, the feature is
+            # enabled, and a Pexels key is configured.
+            task_record = await self.task_repo.get_task_by_id(self.db, task_id)
+            broll_enabled = (
+                bool(task_record and task_record.get("include_broll"))
+                and self.config.enable_broll
+                and bool(self.config.pexels_api_key)
+            )
+            if broll_enabled:
+                logger.info(f"Task {task_id}: B-roll enabled")
+
             # Process video with progress updates
             pipeline_start = perf_counter()
             result = await self.video_service.process_video_complete(
@@ -221,6 +233,7 @@ class TaskService:
                 add_subtitles=add_subtitles,
                 cached_transcript=cached_transcript,
                 cached_analysis_json=cached_analysis_json,
+                include_broll=broll_enabled,
                 progress_callback=update_progress,
                 should_cancel=should_cancel,
                 on_transcript_ready=on_transcript_ready,
@@ -245,6 +258,22 @@ class TaskService:
             clips_output_dir = Path(self.config.temp_dir) / "clips"
             clips_output_dir.mkdir(parents=True, exist_ok=True)
 
+            # Fetch B-roll footage once for all opportunities (absolute timestamps);
+            # per-clip filtering + clip-relative conversion happens in the loop.
+            broll_all = []
+            if broll_enabled:
+                broll_opps = result.get("broll_opportunities") or []
+                if broll_opps:
+                    orientation = (
+                        "portrait" if output_format == "vertical" else "landscape"
+                    )
+                    broll_all = await fetch_broll_for_opportunities(
+                        broll_opps, clips_output_dir, orientation=orientation
+                    )
+                    logger.info(
+                        f"Fetched {len(broll_all)} B-roll clip(s) for {len(broll_opps)} opportunity(ies)"
+                    )
+
             clip_ids = []
             render_start = perf_counter()
 
@@ -266,6 +295,23 @@ class TaskService:
                 initial_focus_side = (
                     focus_mode if focus_mode in ("left", "center", "right") else None
                 )
+
+                # Select B-roll that falls within this segment and rebase its
+                # timestamps to clip-relative seconds.
+                clip_broll: List[Dict[str, Any]] = []
+                if broll_all:
+                    seg_start = parse_timestamp_to_seconds(segment["start_time"])
+                    seg_end = parse_timestamp_to_seconds(segment["end_time"])
+                    for s in broll_all:
+                        if s.local_path and seg_start <= s.timestamp < seg_end:
+                            clip_broll.append(
+                                {
+                                    "local_path": s.local_path,
+                                    "timestamp": s.timestamp - seg_start,
+                                    "duration": s.duration,
+                                }
+                            )
+
                 clip_info = await self.video_service.create_single_clip(
                     video_path,
                     segment,
@@ -278,6 +324,7 @@ class TaskService:
                     output_format,
                     add_subtitles,
                     initial_focus_side,
+                    broll_suggestions=clip_broll or None,
                 )
                 if clip_info is None:
                     continue  # Skip failed clip

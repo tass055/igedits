@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Awaitable
 import logging
 import json
+import os
 import subprocess
 
 from ..utils.async_helpers import run_in_thread
@@ -20,6 +21,7 @@ from ..video_utils import (
     create_clips_with_transitions,
     create_optimized_clip,
     parse_timestamp_to_seconds,
+    apply_broll_to_clip,
 )
 from ..ai import get_most_relevant_parts_by_transcript
 from ..config import Config
@@ -103,13 +105,15 @@ class VideoService:
         return transcript
 
     @staticmethod
-    async def analyze_transcript(transcript: str) -> Any:
+    async def analyze_transcript(transcript: str, include_broll: bool = False) -> Any:
         """
         Analyze transcript with AI to find relevant segments.
         This is already async, no need to wrap.
         """
         logger.info("Starting AI analysis of transcript")
-        relevant_parts = await get_most_relevant_parts_by_transcript(transcript)
+        relevant_parts = await get_most_relevant_parts_by_transcript(
+            transcript, include_broll=include_broll
+        )
         logger.info(
             f"AI analysis complete: {len(relevant_parts.most_relevant_segments)} segments found"
         )
@@ -165,8 +169,13 @@ class VideoService:
         output_format: str = "vertical",
         add_subtitles: bool = True,
         focus_side: Optional[str] = None,
+        broll_suggestions: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Render a single clip in the thread pool and return clip_info dict, or None on failure."""
+        """Render a single clip in the thread pool and return clip_info dict, or None on failure.
+
+        broll_suggestions: optional list of {local_path, timestamp (clip-relative
+        seconds), duration} to cut over the finished clip.
+        """
         try:
             start_seconds = parse_timestamp_to_seconds(segment["start_time"])
             end_seconds = parse_timestamp_to_seconds(segment["end_time"])
@@ -203,6 +212,22 @@ class VideoService:
             if not success:
                 logger.error(f"Failed to create clip {clip_index + 1}")
                 return None
+
+            # Overlay B-roll cutaways at the AI-identified moments, if any.
+            if broll_suggestions:
+                broll_output = clip_path.with_name(f"{clip_path.stem}_broll.mp4")
+                applied = await run_in_thread(
+                    apply_broll_to_clip, clip_path, broll_suggestions, broll_output
+                )
+                if applied and broll_output.exists():
+                    os.replace(broll_output, clip_path)
+                    logger.info(
+                        f"Applied {len(broll_suggestions)} B-roll insert(s) to clip {clip_index + 1}"
+                    )
+                else:
+                    logger.warning(
+                        f"B-roll overlay failed for clip {clip_index + 1}; using clip without B-roll"
+                    )
 
             logger.info(f"Created clip {clip_index + 1}: {duration:.1f}s")
             return {
@@ -263,6 +288,7 @@ class VideoService:
         add_subtitles: bool = True,
         cached_transcript: Optional[str] = None,
         cached_analysis_json: Optional[str] = None,
+        include_broll: bool = False,
         progress_callback: Optional[Callable[[int, str, str], Awaitable[None]]] = None,
         should_cancel: Optional[Callable[[], Awaitable[bool]]] = None,
         on_transcript_ready: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -359,7 +385,9 @@ class VideoService:
                     relevant_parts = None
 
             if relevant_parts is None:
-                relevant_parts = await VideoService.analyze_transcript(transcript)
+                relevant_parts = await VideoService.analyze_transcript(
+                    transcript, include_broll=include_broll
+                )
 
             # Step 4: Create clips
             if should_cancel and await should_cancel():
@@ -395,9 +423,26 @@ class VideoService:
             if processing_mode == "fast":
                 segments_json = segments_json[: config.fast_mode_max_clips]
 
+            # Serialize B-roll opportunities (absolute timestamps) for the render step.
+            broll_opportunities_json: List[Dict[str, Any]] = []
+            raw_broll = getattr(relevant_parts, "broll_opportunities", None) or []
+            for opp in raw_broll:
+                if isinstance(opp, dict):
+                    broll_opportunities_json.append(opp)
+                else:
+                    broll_opportunities_json.append(
+                        {
+                            "timestamp": opp.timestamp,
+                            "duration": opp.duration,
+                            "search_term": opp.search_term,
+                            "context": opp.context,
+                        }
+                    )
+
             return {
                 "segments": segments_json,
                 "segments_to_render": segments_json,
+                "broll_opportunities": broll_opportunities_json,
                 "video_path": str(video_path),
                 "clips": [],
                 "summary": relevant_parts.summary if relevant_parts else None,

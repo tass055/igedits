@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
       target: ${FRONTEND_BUILD_TARGET:-runner}
       args:
-        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8888}
         - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
         - NEXT_PUBLIC_SELF_HOST=${SELF_HOST:-true}
         - NEXT_PUBLIC_PRO_PRICE_MONTHLY=${NEXT_PUBLIC_PRO_PRICE_MONTHLY:-9.99}
@@ -22,13 +22,13 @@ services:
       - ./frontend/prisma:/app/prisma
     environment:
       - NEXT_TELEMETRY_DISABLED=1
-      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
-      - BACKEND_INTERNAL_URL=http://backend:8000
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8888}
+      - BACKEND_INTERNAL_URL=http://backend:8888
       - NEXT_PUBLIC_SELF_HOST=${SELF_HOST:-true}
       - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       - NEXT_PUBLIC_LANDING_ONLY_MODE=${NEXT_PUBLIC_LANDING_ONLY_MODE:-false}
       - BACKEND_AUTH_SECRET=${BACKEND_AUTH_SECRET:?BACKEND_AUTH_SECRET not set}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-igedits}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-igedits}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-igedits}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-igedits}?connection_limit=15&pool_timeout=30
       - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET not set}
       - BETTER_AUTH_URL=${BETTER_AUTH_URL:-http://localhost:3000}
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
@@ -59,7 +59,7 @@ services:
       dockerfile: Dockerfile
     container_name: igedits-backend
     platform: linux/amd64
-    command: [".venv/bin/uvicorn", "src.main_refactored:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: [".venv/bin/uvicorn", "src.main_refactored:app", "--host", "0.0.0.0", "--port", "8888"]
     # Handles trim/split/regenerate encoding — needs GPU when VIDEO_ENCODER=nvenc.
     deploy:
       resources:
@@ -69,12 +69,20 @@ services:
         reservations:
           cpus: "0.5"
           memory: 512M
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+
+#      resources:
+#        limits:
+#          cpus: "2.0"
+#          memory: 4G
+#        reservations:
+#          cpus: "0.5"
+#          memory: 512M
+#          devices:
+#            - driver: nvidia
+#              count: 1
+#              capabilities: [gpu]
     ports:
-      - "8000:8000"
+      - "8888:8888"
     volumes:
       - ./backend/src:/app/src
       - uploads:/app/uploads
@@ -99,8 +107,14 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_API_KEY=${OLLAMA_API_KEY}
+      - LLM_MAX_RPM=${LLM_MAX_RPM:-25}
+      - LLM_MAX_RPS=${LLM_MAX_RPS:-1}
+      - LLM_MAX_TPM=${LLM_MAX_TPM:-10000}
+      - LLM_MAX_REQUEST_TOKENS=${LLM_MAX_REQUEST_TOKENS:-8000}
+      - LLM_REQUEST_TOKEN_OVERHEAD=${LLM_REQUEST_TOKEN_OVERHEAD:-4000}
       - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-medium}
       - QUEUED_TASK_TIMEOUT_SECONDS=${QUEUED_TASK_TIMEOUT_SECONDS:-180}
       - DEFAULT_PROCESSING_MODE=${DEFAULT_PROCESSING_MODE:-fast}
@@ -116,6 +130,7 @@ services:
       - "RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL:-igedits <onboarding@resend.dev>}"
       - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       - PEXELS_API_KEY=${PEXELS_API_KEY}
+      - ENABLE_BROLL=${ENABLE_BROLL:-true}
       - DISCORD_FEEDBACK_WEBHOOK_URL=${DISCORD_FEEDBACK_WEBHOOK_URL}
       - DISCORD_SALES_WEBHOOK_URL=${DISCORD_SALES_WEBHOOK_URL}
       - TRANSCRIPT_LANGUAGE=${TRANSCRIPT_LANGUAGE}
@@ -133,7 +148,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8888/health"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -191,8 +206,14 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_API_KEY=${OLLAMA_API_KEY}
+      - LLM_MAX_RPM=${LLM_MAX_RPM:-25}
+      - LLM_MAX_RPS=${LLM_MAX_RPS:-1}
+      - LLM_MAX_TPM=${LLM_MAX_TPM:-10000}
+      - LLM_MAX_REQUEST_TOKENS=${LLM_MAX_REQUEST_TOKENS:-8000}
+      - LLM_REQUEST_TOKEN_OVERHEAD=${LLM_REQUEST_TOKEN_OVERHEAD:-4000}
       - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-medium}
       - QUEUED_TASK_TIMEOUT_SECONDS=${QUEUED_TASK_TIMEOUT_SECONDS:-180}
       - DEFAULT_PROCESSING_MODE=${DEFAULT_PROCESSING_MODE:-fast}
@@ -208,6 +229,7 @@ services:
       - "RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL:-igedits <onboarding@resend.dev>}"
       - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       - PEXELS_API_KEY=${PEXELS_API_KEY}
+      - ENABLE_BROLL=${ENABLE_BROLL:-true}
       - DISCORD_FEEDBACK_WEBHOOK_URL=${DISCORD_FEEDBACK_WEBHOOK_URL}
       - DISCORD_SALES_WEBHOOK_URL=${DISCORD_SALES_WEBHOOK_URL}
       - TRANSCRIPT_LANGUAGE=${TRANSCRIPT_LANGUAGE}
@@ -270,10 +292,41 @@ services:
       timeout: 10s
       retries: 3
 
+  # Syncs completed clips + AI captions/hashtags to Dropbox via rclone.
+  dropbox-sync:
+    build:
+      context: ./sync
+      dockerfile: Dockerfile
+    container_name: igedits-dropbox-sync
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-igedits}
+      - POSTGRES_USER=${POSTGRES_USER:-igedits}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+      - BACKEND_URL=http://backend:8888
+      - DROPBOX_REMOTE=${DROPBOX_REMOTE:-dropbox}
+      - DROPBOX_PATH=${DROPBOX_PATH:-igedits-clips}
+      - SYNC_INTERVAL_SECONDS=${SYNC_INTERVAL_SECONDS:-300}
+      - CLIPS_DIR=/app/uploads/clips
+    volumes:
+      - uploads:/app/uploads:ro
+      - dropbox_sync_state:/state
+      - dropbox_sync_export:/export
+      - ./sync/rclone-config:/config/rclone
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   uploads:
     driver: local
   clips:
+    driver: local
+  dropbox_sync_state:
+    driver: local
+  dropbox_sync_export:
     driver: local
   redis_data:
     driver: local

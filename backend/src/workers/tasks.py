@@ -120,7 +120,8 @@ async def process_video_task(
             except Exception:
                 logger.exception("Failed to persist dead-letter payload")
             # Error will be caught by arq and task status will be updated
-            raise
+            # Raise a standard Exception to avoid pickling errors with complex objects like ClientError
+            raise Exception(f"{type(e).__name__}: {str(e)}")
 
 async def rerender_clip_focus_worker(
     ctx: Dict[str, Any], task_id: str, clip_id: str
@@ -151,7 +152,8 @@ async def rerender_clip_focus_worker(
                     )
             except Exception:
                 logger.exception("Failed to record focus_status=error")
-            raise
+            # Raise a standard Exception to avoid pickling errors
+            raise Exception(f"{type(e).__name__}: {str(e)}")
 
 
 # Worker configuration for arq
