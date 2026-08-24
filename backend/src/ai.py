@@ -12,6 +12,7 @@ from pydantic_ai import Agent
 from pydantic import BaseModel, Field
 
 from .config import Config
+from .rate_limit import acquire_llm_slot, estimate_tokens
 
 logger = logging.getLogger(__name__)
 config = Config()
@@ -21,32 +22,89 @@ class RetryableAIError(Exception):
     """Upstream LLM overload/rate-limit. Safe for the caller to retry."""
 
 
+class RequestTooLargeError(Exception):
+    """The request exceeded the model's per-request / TPM token ceiling.
+
+    This is NOT transient — retrying the same request fails identically — so it
+    must fail fast with an actionable message instead of looping.
+    """
+
+
+def _is_request_too_large(exc: BaseException) -> bool:
+    """A single request exceeded the provider's size/TPM limit (e.g. Groq 413)."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status == 413:
+        return True
+    msg = str(exc).lower()
+    markers = (
+        "request too large",
+        "reduce your message size",
+        "payload too large",
+        "context length",
+        "maximum context",
+    )
+    return any(m in msg for m in markers)
+
+
 def _is_retryable_ai_error(exc: BaseException) -> bool:
+    # A too-large request is never retryable regardless of how its message reads.
+    if _is_request_too_large(exc):
+        return False
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     if status in (429, 503, 502, 504):
         return True
     msg = str(exc).lower()
-    markers = ("503", "429", "unavailable", "overloaded", "rate limit", "rate_limit", "high demand")
+    markers = (
+        "503", "429", "unavailable", "overloaded", "rate limit", "rate_limit", "high demand",
+        # Groq/llama intermittently emit a malformed function call for complex
+        # structured output; a re-roll usually produces a valid one.
+        "tool_use_failed", "failed to call a function",
+    )
     return any(m in msg for m in markers)
 
 
-async def _run_agent_with_retry(agent: Agent, prompt: str, max_attempts: int = 6):
-    """Exponential backoff around a transient upstream LLM failure."""
-    delay = 5.0
+async def _run_agent_with_retry(agent: Agent, prompt: str, max_attempts: int = 5):
+    """Exponential backoff around a transient upstream LLM failure.
+
+    Every attempt first acquires a slot from the distributed rate limiter so the
+    provider's per-second / per-minute thresholds are respected proactively. The
+    backoff below remains only as a safety net for genuine upstream hiccups.
+    """
+    delay = 10.0
     last_exc: Optional[BaseException] = None
+    # Reserve budget for the fixed system prompt + output schema so the rate
+    # limiter's TPM accounting reflects the real request size, not just the prompt.
+    est_tokens = estimate_tokens(prompt) + config.llm_request_token_overhead
     for attempt in range(1, max_attempts + 1):
         try:
+            await acquire_llm_slot(est_tokens=est_tokens)
             return await agent.run(prompt)
         except Exception as e:
             last_exc = e
+            if _is_request_too_large(e):
+                raise RequestTooLargeError(
+                    "The transcript analysis request was too large for the model's "
+                    "token limit. Lower LLM_MAX_REQUEST_TOKENS "
+                    f"(currently {config.llm_max_request_tokens}) so the transcript "
+                    "is split into smaller chunks, or switch to a model/tier with a "
+                    f"higher token-per-minute limit. Details: {e}"
+                ) from e
             if not _is_retryable_ai_error(e) or attempt == max_attempts:
                 raise
+            # Malformed-tool-call errors are a formatting hiccup, not a rate
+            # problem — re-roll quickly. Rate/overload errors need real backoff.
+            msg = str(e).lower()
+            is_format_error = (
+                "tool_use_failed" in msg or "failed to call a function" in msg
+            )
+            wait = 2.0 if is_format_error else delay
             logger.warning(
                 f"Upstream LLM transient error (attempt {attempt}/{max_attempts}): {e}. "
-                f"Retrying in {delay:.1f}s"
+                f"Retrying in {wait:.1f}s"
             )
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 30.0)
+            await asyncio.sleep(wait)
+            if not is_format_error:
+                delay = min(delay * 1.5, 65.0)
     if last_exc:
         raise last_exc
 
@@ -252,6 +310,13 @@ def _get_missing_llm_key_error(model_name: str) -> Optional[str]:
             "Set ANTHROPIC_API_KEY or choose another provider with a matching API key."
         )
 
+    if provider == "groq" and not config.groq_api_key:
+        return (
+            "Selected LLM provider is Groq, but GROQ_API_KEY is not set. "
+            "Set GROQ_API_KEY (free tier at https://console.groq.com/keys) "
+            "or choose another provider with a matching API key."
+        )
+
     if provider == "ollama":
         # Ollama can run locally without an API key. OLLAMA_BASE_URL/OLLAMA_API_KEY
         # are optional and passed through as environment variables.
@@ -311,101 +376,158 @@ Transcript:
 {transcript}"""
 
 
+def _validate_segments(segments) -> List[TranscriptSegment]:
+    """Filter and repair raw model segments (drop empty/too-short/invalid, fix scores)."""
+    validated: List[TranscriptSegment] = []
+    for segment in segments:
+        # Validate text content
+        if not segment.text.strip() or len(segment.text.split()) < 3:
+            logger.warning(
+                f"Skipping segment with insufficient content: '{segment.text[:50]}...'"
+            )
+            continue
+
+        # Validate timestamps - CRITICAL: start and end must be different
+        if segment.start_time == segment.end_time:
+            logger.warning(
+                f"Skipping segment with identical start/end times: {segment.start_time}"
+            )
+            continue
+
+        # Parse timestamps to validate duration
+        try:
+            start_parts = segment.start_time.split(":")
+            end_parts = segment.end_time.split(":")
+
+            start_seconds = int(start_parts[0]) * 60 + int(start_parts[1])
+            end_seconds = int(end_parts[0]) * 60 + int(end_parts[1])
+
+            duration = end_seconds - start_seconds
+
+            if duration <= 0:
+                logger.warning(
+                    f"Skipping segment with invalid duration: {segment.start_time} to {segment.end_time} = {duration}s"
+                )
+                continue
+
+            if duration < 5:  # Minimum 5 seconds
+                logger.warning(
+                    f"Skipping segment too short: {duration}s (min 5s required)"
+                )
+                continue
+
+            # Validate virality scores
+            if segment.virality:
+                # Ensure total score is sum of subscores
+                calculated_total = (
+                    segment.virality.hook_score
+                    + segment.virality.engagement_score
+                    + segment.virality.value_score
+                    + segment.virality.shareability_score
+                )
+                if segment.virality.total_score != calculated_total:
+                    logger.warning(
+                        f"Correcting virality total: {segment.virality.total_score} -> {calculated_total}"
+                    )
+                    segment.virality.total_score = calculated_total
+
+            validated.append(segment)
+            virality_info = (
+                f", virality={segment.virality.total_score}"
+                if segment.virality
+                else ""
+            )
+            logger.info(
+                f"Validated segment: {segment.start_time}-{segment.end_time} ({duration}s){virality_info}"
+            )
+
+        except (ValueError, IndexError) as e:
+            logger.warning(
+                f"Skipping segment with invalid timestamp format: {segment.start_time}-{segment.end_time}: {e}"
+            )
+            continue
+    return validated
+
+
+def _split_transcript_into_chunks(transcript: str) -> List[str]:
+    """Split the timestamped transcript into chunks that fit under the per-request
+    token budget. Splits on line boundaries so each timestamped span stays intact.
+    """
+    max_transcript_tokens = max(
+        config.llm_max_request_tokens - config.llm_request_token_overhead, 1000
+    )
+
+    if estimate_tokens(transcript) <= max_transcript_tokens:
+        return [transcript]
+
+    chunks: List[str] = []
+    current: List[str] = []
+    current_tokens = 0
+    for line in transcript.split("\n"):
+        line_tokens = estimate_tokens(line) + 1
+        if current and current_tokens + line_tokens > max_transcript_tokens:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_tokens = line_tokens
+        else:
+            current.append(line)
+            current_tokens += line_tokens
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 async def get_most_relevant_parts_by_transcript(
     transcript: str, include_broll: bool = False
 ) -> TranscriptAnalysis:
-    """Get the most relevant parts of a transcript with virality scoring and optional B-roll detection."""
+    """Get the most relevant parts of a transcript with virality scoring and optional B-roll detection.
+
+    Long transcripts are analyzed in chunks so no single request exceeds the
+    provider's per-request / TPM ceiling; results are merged and de-duplicated.
+    """
     logger.info(
         f"Starting AI analysis of transcript ({len(transcript)} chars), include_broll={include_broll}"
     )
 
     try:
         agent = get_transcript_agent()
+        chunks = _split_transcript_into_chunks(transcript)
+        logger.info(f"Analyzing transcript in {len(chunks)} chunk(s)")
 
-        result = await _run_agent_with_retry(
-            agent,
-            build_transcript_analysis_prompt(
-                transcript=transcript, include_broll=include_broll
-            ),
-        )
+        merged_segments: List[TranscriptSegment] = []
+        seen_ranges = set()
+        summaries: List[str] = []
+        key_topics: List[str] = []
+        broll_opportunities: List[BRollOpportunity] = []
 
-        analysis = result.data
-        logger.info(
-            f"AI analysis found {len(analysis.most_relevant_segments)} segments"
-        )
+        for idx, chunk in enumerate(chunks, start=1):
+            result = await _run_agent_with_retry(
+                agent,
+                build_transcript_analysis_prompt(
+                    transcript=chunk, include_broll=include_broll
+                ),
+            )
+            analysis = result.data
+            logger.info(
+                f"Chunk {idx}/{len(chunks)}: {len(analysis.most_relevant_segments)} raw segments"
+            )
 
-        # Validation with virality data handling
-        validated_segments = []
-        for segment in analysis.most_relevant_segments:
-            # Validate text content
-            if not segment.text.strip() or len(segment.text.split()) < 3:
-                logger.warning(
-                    f"Skipping segment with insufficient content: '{segment.text[:50]}...'"
-                )
-                continue
-
-            # Validate timestamps - CRITICAL: start and end must be different
-            if segment.start_time == segment.end_time:
-                logger.warning(
-                    f"Skipping segment with identical start/end times: {segment.start_time}"
-                )
-                continue
-
-            # Parse timestamps to validate duration
-            try:
-                start_parts = segment.start_time.split(":")
-                end_parts = segment.end_time.split(":")
-
-                start_seconds = int(start_parts[0]) * 60 + int(start_parts[1])
-                end_seconds = int(end_parts[0]) * 60 + int(end_parts[1])
-
-                duration = end_seconds - start_seconds
-
-                if duration <= 0:
-                    logger.warning(
-                        f"Skipping segment with invalid duration: {segment.start_time} to {segment.end_time} = {duration}s"
-                    )
+            for segment in _validate_segments(analysis.most_relevant_segments):
+                key = (segment.start_time, segment.end_time)
+                if key in seen_ranges:
                     continue
+                seen_ranges.add(key)
+                merged_segments.append(segment)
 
-                if duration < 5:  # Minimum 5 seconds
-                    logger.warning(
-                        f"Skipping segment too short: {duration}s (min 5s required)"
-                    )
-                    continue
-
-                # Validate virality scores
-                if segment.virality:
-                    # Ensure total score is sum of subscores
-                    calculated_total = (
-                        segment.virality.hook_score
-                        + segment.virality.engagement_score
-                        + segment.virality.value_score
-                        + segment.virality.shareability_score
-                    )
-                    if segment.virality.total_score != calculated_total:
-                        logger.warning(
-                            f"Correcting virality total: {segment.virality.total_score} -> {calculated_total}"
-                        )
-                        segment.virality.total_score = calculated_total
-
-                validated_segments.append(segment)
-                virality_info = (
-                    f", virality={segment.virality.total_score}"
-                    if segment.virality
-                    else ""
-                )
-                logger.info(
-                    f"Validated segment: {segment.start_time}-{segment.end_time} ({duration}s){virality_info}"
-                )
-
-            except (ValueError, IndexError) as e:
-                logger.warning(
-                    f"Skipping segment with invalid timestamp format: {segment.start_time}-{segment.end_time}: {e}"
-                )
-                continue
+            if analysis.summary:
+                summaries.append(analysis.summary)
+            if analysis.key_topics:
+                key_topics.extend(analysis.key_topics)
+            if include_broll and analysis.broll_opportunities:
+                broll_opportunities.extend(analysis.broll_opportunities)
 
         # Sort by virality score (primary) then relevance (secondary)
-        validated_segments.sort(
+        merged_segments.sort(
             key=lambda x: (
                 x.virality.total_score if x.virality else 0,
                 x.relevance_score,
@@ -413,16 +535,22 @@ async def get_most_relevant_parts_by_transcript(
             reverse=True,
         )
 
+        # Cap to the configured maximum so multi-chunk merges don't over-produce.
+        if config.max_clips and len(merged_segments) > config.max_clips:
+            merged_segments = merged_segments[: config.max_clips]
+
         final_analysis = TranscriptAnalysis(
-            most_relevant_segments=validated_segments,
-            summary=analysis.summary,
-            key_topics=analysis.key_topics,
-            broll_opportunities=analysis.broll_opportunities if include_broll else None,
+            most_relevant_segments=merged_segments,
+            summary=" ".join(summaries) if summaries else "",
+            key_topics=list(dict.fromkeys(key_topics)),
+            broll_opportunities=broll_opportunities
+            if (include_broll and broll_opportunities)
+            else None,
         )
 
-        logger.info(f"Selected {len(validated_segments)} segments for processing")
-        if validated_segments:
-            top = validated_segments[0]
+        logger.info(f"Selected {len(merged_segments)} segments for processing")
+        if merged_segments:
+            top = merged_segments[0]
             logger.info(
                 f"Top segment - relevance: {top.relevance_score:.2f}, virality: {top.virality.total_score if top.virality else 'N/A'}"
             )

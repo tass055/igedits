@@ -1,9 +1,12 @@
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
-import { PrismaClient } from "../generated/prisma";
+import prisma from "./prisma";
 import { nextCookies } from "better-auth/next-js";
 
-const prisma = new PrismaClient();
+// Reuse the shared Prisma singleton instead of creating a second client here.
+// A separate PrismaClient opens its own connection pool, so under load the
+// backend + auth pools compete for Postgres connections and sign-in requests
+// time out ("Timed out fetching a new connection from the connection pool").
 const disableSignUp = ["1", "true", "yes"].includes(
   (process.env.DISABLE_SIGN_UP ?? "").toLowerCase()
 );

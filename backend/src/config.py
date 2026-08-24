@@ -11,6 +11,7 @@ class Config:
         self.openai_api_key = self._get_optional_env("OPENAI_API_KEY")
         self.anthropic_api_key = self._get_optional_env("ANTHROPIC_API_KEY")
         self.google_api_key = self._get_optional_env("GOOGLE_API_KEY")
+        self.groq_api_key = self._get_optional_env("GROQ_API_KEY")
         self.youtube_data_api_key = self._get_optional_env("YOUTUBE_DATA_API_KEY")
         self.ollama_base_url = self._get_optional_env("OLLAMA_BASE_URL")
         self.ollama_api_key = self._get_optional_env("OLLAMA_API_KEY")
@@ -20,6 +21,10 @@ class Config:
         self.llm = self._get_optional_env("LLM") or self._infer_default_llm()
         self.assembly_ai_api_key = os.getenv("ASSEMBLY_AI_API_KEY")
         self.pexels_api_key = os.getenv("PEXELS_API_KEY")
+        # B-roll overlays: fetch stock footage from Pexels and cut it over clips at
+        # AI-identified moments. Active only when both this flag and a Pexels key
+        # are set, and the task itself requested B-roll.
+        self.enable_broll = self._get_bool_env("ENABLE_BROLL", True)
         self.apify_api_token = self._get_optional_env("APIFY_API_TOKEN")
         self.youtube_metadata_provider = self._normalize_youtube_metadata_provider(
             os.getenv("YOUTUBE_METADATA_PROVIDER", "yt_dlp")
@@ -91,6 +96,25 @@ class Config:
             "FAST_MODE_TRANSCRIPT_MODEL", "nano"
         )
 
+        # Proactive LLM rate limiting (see rate_limit.py). Enforced across the
+        # backend + worker processes via a Redis-backed token bucket so provider
+        # per-minute / per-second thresholds are never exceeded. 0 disables a check.
+        # Defaults sit under Groq's free-tier ceiling for llama-3.3-70b (~30 RPM,
+        # ~12k TPM); override to match your account's actual limits.
+        self.llm_max_rpm = int(os.getenv("LLM_MAX_RPM", "25"))
+        self.llm_max_rps = int(os.getenv("LLM_MAX_RPS", "1"))
+        self.llm_max_tpm = int(os.getenv("LLM_MAX_TPM", "10000"))
+
+        # Transcript analysis is split into chunks so a single request never
+        # exceeds the provider's per-request / TPM ceiling (Groq free tier rejects
+        # requests over ~12k tokens). LLM_MAX_REQUEST_TOKENS is the target size of
+        # one request; LLM_REQUEST_TOKEN_OVERHEAD reserves budget for the fixed
+        # system prompt + output schema, leaving the remainder for transcript text.
+        self.llm_max_request_tokens = int(os.getenv("LLM_MAX_REQUEST_TOKENS", "8000"))
+        self.llm_request_token_overhead = int(
+            os.getenv("LLM_REQUEST_TOKEN_OVERHEAD", "4000")
+        )
+
     @staticmethod
     def _get_optional_env(name: str):
         value = os.getenv(name)
@@ -141,6 +165,8 @@ class Config:
         Infer a usable default model based on whichever API key is present.
         Falls back to Google for backward compatibility.
         """
+        if self.groq_api_key:
+            return "groq:llama-3.3-70b-versatile"
         if self.google_api_key:
             return "google-gla:gemini-3-flash-preview"
         if self.openai_api_key:

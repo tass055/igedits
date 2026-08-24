@@ -250,12 +250,30 @@ async def upload_video(request: Request):
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         video_path = uploads_dir / unique_filename
 
-        # Save the uploaded file
+        # Save the uploaded file. Stream in chunks instead of buffering the whole
+        # file in memory — large videos (hundreds of MB) would otherwise be read
+        # fully into RAM, and a mid-transfer failure could silently truncate it.
+        bytes_written = 0
+        chunk_size = 1024 * 1024  # 1 MiB
         async with aiofiles.open(video_path, "wb") as f:
-            content = await upload.read()
-            await f.write(content)
+            while True:
+                chunk = await upload.read(chunk_size)
+                if not chunk:
+                    break
+                await f.write(chunk)
+                bytes_written += len(chunk)
 
-        logger.info(f"✅ Video uploaded successfully to: {video_path}")
+        if bytes_written == 0:
+            video_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file was empty. Please try uploading again.",
+            )
+
+        logger.info(
+            f"✅ Video uploaded successfully to: {video_path} "
+            f"({bytes_written // 1024} KB)"
+        )
 
         return {
             "message": "Video uploaded successfully",

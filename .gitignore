@@ -8,6 +8,7 @@ htmlcov/
 logs/
 temp/
 .env
+sync/rclone-config/
 *.m4a
 frontend/e2e/.seed.json
 *.md

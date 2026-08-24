@@ -154,6 +154,54 @@ class VideoProcessor:
         return settings.get(target_quality, settings["high"])
 
 
+class CorruptMediaError(Exception):
+    """The input file is not a readable media container (e.g. truncated upload)."""
+
+
+def _validate_media_file(media_path: Path) -> None:
+    """Fail fast with a clear message if the file is not a decodable media container.
+
+    Catches the common "corrupt/incomplete upload" case (a truncated .mov/.mp4
+    with a missing ``moov`` atom) before we waste an upload to AssemblyAI, which
+    would otherwise return a misleading "Transcoding failed" error.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(media_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except FileNotFoundError:
+        # ffprobe not available — skip validation rather than block processing.
+        logger.warning("ffprobe not found; skipping media validation")
+        return
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"Media validation skipped due to error: {exc}")
+        return
+
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        logger.error(f"Media validation failed for {media_path}: {stderr}")
+        if "moov atom not found" in stderr.lower():
+            raise CorruptMediaError(
+                "The uploaded video appears to be corrupt or incomplete "
+                "(missing 'moov' atom — the file's index). This usually means the "
+                "upload was interrupted or the source recording was never finalized. "
+                "Please re-export the video and upload it again."
+            )
+        raise CorruptMediaError(
+            f"The uploaded video could not be read as a valid media file: {stderr}"
+        )
+
+
 def get_video_transcript(video_path: Path, speech_model: str = "best") -> str:
     """Get transcript using AssemblyAI with word-level timing for precise subtitles."""
     logger.info(f"Getting transcript for: {video_path}")
@@ -175,6 +223,10 @@ def get_video_transcript(video_path: Path, speech_model: str = "best") -> str:
         language_code=config.transcript_language or None,
     )
 
+    # Reject corrupt/incomplete files up front with a clear, actionable error
+    # instead of a misleading downstream "Transcoding failed" from AssemblyAI.
+    _validate_media_file(video_path)
+
     audio_path = video_path.with_suffix(".aai_audio.mp3")
     try:
         logger.info("Starting AssemblyAI transcription")
@@ -190,9 +242,16 @@ def get_video_transcript(video_path: Path, speech_model: str = "best") -> str:
                 ],
                 check=True,
                 capture_output=True,
+                text=True,
             )
             upload_path = audio_path
             logger.info(f"Extracted audio for transcription: {audio_path} ({audio_path.stat().st_size // 1024} KB)")
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                f"Audio extraction failed (exit {exc.returncode}): "
+                f"{(exc.stderr or '').strip()}. Falling back to original file"
+            )
+            upload_path = video_path
         except Exception as exc:
             logger.warning(f"Audio extraction failed ({exc}), falling back to original file")
             upload_path = video_path
@@ -384,6 +443,38 @@ def get_safe_vertical_position(
     return max(min_top_padding, min(desired_y, max_y))
 
 
+def _cluster_face_centers(
+    face_centers: List[Tuple[int, int, int, float]], frame_width: int
+) -> List[dict]:
+    """Group face detections into distinct on-screen speakers by x position.
+
+    Split-screen sources have two (or more) faces present in nearly every
+    frame at roughly fixed x positions. Sorting by x and splitting wherever
+    there's a gap wider than ~15% of the frame width separates them into
+    per-speaker clusters instead of blending everyone together.
+    """
+    gap_threshold = frame_width * 0.15
+    sorted_faces = sorted(face_centers, key=lambda f: f[0])
+
+    groups: List[List[Tuple[int, int, int, float]]] = [[sorted_faces[0]]]
+    for face in sorted_faces[1:]:
+        if face[0] - groups[-1][-1][0] > gap_threshold:
+            groups.append([face])
+        else:
+            groups[-1].append(face)
+
+    clusters = []
+    for group in groups:
+        total_weight = sum(area * confidence for _, _, area, confidence in group)
+        if total_weight <= 0:
+            continue
+        weighted_x = sum(x * area * confidence for x, y, area, confidence in group) / total_weight
+        weighted_y = sum(y * area * confidence for x, y, area, confidence in group) / total_weight
+        clusters.append({"x": weighted_x, "y": weighted_y, "weight": total_weight})
+
+    return clusters or [{"x": frame_width / 2, "y": 0, "weight": 0}]
+
+
 def detect_optimal_crop_region(
     video_clip: VideoFileClip,
     start_time: float,
@@ -403,8 +494,50 @@ def detect_optimal_crop_region(
             new_width = round_to_even(original_width)
             new_height = round_to_even(int(original_width / target_ratio))
 
-        # Fixed-side crop: skip face detection entirely
-        if focus_side in ("left", "center", "right"):
+        # Try improved face detection
+        face_centers = detect_faces_in_clip(video_clip, start_time, end_time)
+
+        # Calculate crop position
+        if face_centers:
+            # Group faces into distinct on-screen speakers (e.g. split-screen
+            # interviews) instead of blending everyone into one average — a
+            # naive average of two side-by-side faces lands the crop on the
+            # seam between them, cutting both off.
+            clusters = _cluster_face_centers(face_centers, original_width)
+
+            if len(clusters) > 1 and focus_side in ("left", "right"):
+                # Pick the cluster on the requested side rather than assuming
+                # a fixed edge of the frame lines up with that speaker.
+                clusters.sort(key=lambda c: c["x"])
+                chosen = clusters[0] if focus_side == "left" else clusters[-1]
+                logger.info(
+                    f"{len(clusters)} face clusters found; picked {focus_side} "
+                    f"cluster (x={chosen['x']:.0f}) for crop"
+                )
+            else:
+                # No side requested, or only one cluster: use the most
+                # prominent (highest total weight) speaker.
+                chosen = max(clusters, key=lambda c: c["weight"])
+                logger.info(
+                    f"{len(clusters)} face cluster(s) found; picked most "
+                    f"prominent cluster (x={chosen['x']:.0f}) for crop"
+                )
+
+            weighted_x = chosen["x"]
+            weighted_y = chosen["y"]
+
+            # Add slight bias towards upper portion for better face framing
+            weighted_y = max(0, weighted_y - new_height * 0.1)
+
+            x_offset = max(
+                0, min(int(weighted_x - new_width // 2), original_width - new_width)
+            )
+            y_offset = max(
+                0,
+                min(int(weighted_y - new_height // 2), original_height - new_height),
+            )
+        elif focus_side in ("left", "center", "right"):
+            # No faces detected at all: fall back to a fixed-edge crop.
             if focus_side == "left":
                 x_offset = 0
             elif focus_side == "right":
@@ -412,60 +545,7 @@ def detect_optimal_crop_region(
             else:  # center
                 x_offset = round_to_even((original_width - new_width) // 2)
             y_offset = round_to_even((original_height - new_height) // 2)
-            logger.info(f"Fixed {focus_side} crop: offset ({x_offset}, {y_offset})")
-            return (x_offset, y_offset, new_width, new_height)
-
-        # Try improved face detection
-        face_centers = detect_faces_in_clip(video_clip, start_time, end_time)
-
-        # Calculate crop position
-        if face_centers:
-            # Use weighted average of face centers with temporal consistency
-            total_weight = sum(
-                area * confidence for _, _, area, confidence in face_centers
-            )
-            if total_weight > 0:
-                weighted_x = (
-                    sum(
-                        x * area * confidence for x, y, area, confidence in face_centers
-                    )
-                    / total_weight
-                )
-                weighted_y = (
-                    sum(
-                        y * area * confidence for x, y, area, confidence in face_centers
-                    )
-                    / total_weight
-                )
-
-                # Add slight bias towards upper portion for better face framing
-                weighted_y = max(0, weighted_y - new_height * 0.1)
-
-                x_offset = max(
-                    0, min(int(weighted_x - new_width // 2), original_width - new_width)
-                )
-                y_offset = max(
-                    0,
-                    min(
-                        int(weighted_y - new_height // 2), original_height - new_height
-                    ),
-                )
-
-                logger.info(
-                    f"Face-centered crop: {len(face_centers)} faces detected with improved algorithm"
-                )
-            else:
-                # Center crop
-                x_offset = (
-                    (original_width - new_width) // 2
-                    if original_width > new_width
-                    else 0
-                )
-                y_offset = (
-                    (original_height - new_height) // 2
-                    if original_height > new_height
-                    else 0
-                )
+            logger.info(f"No faces detected; fixed {focus_side} crop: offset ({x_offset}, {y_offset})")
         else:
             # Center crop
             x_offset = (

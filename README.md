@@ -40,7 +40,7 @@ Task creation returns in <100 ms. The worker handles the heavy video work asynch
 
 - Docker + Docker Compose
 - An [AssemblyAI](https://www.assemblyai.com/) API key for transcription
-- One LLM provider key: Google Gemini, OpenAI, Anthropic, or a local/remote Ollama instance
+- One LLM provider key: Groq (free tier), Google Gemini, OpenAI, Anthropic, or a local/remote Ollama instance
 
 ### API keys — where to get them
 
@@ -50,6 +50,7 @@ Task creation returns in <100 ms. The worker handles the heavy video work asynch
 | `GOOGLE_API_KEY` | Generous free quota via AI Studio | Pay-per-token after | [aistudio.google.com](https://aistudio.google.com/) → Get API key |
 | `OPENAI_API_KEY` | No free tier (credits expire) | Pay-per-token | [platform.openai.com](https://platform.openai.com/) → API keys |
 | `ANTHROPIC_API_KEY` | No free tier | Pay-per-token | [console.anthropic.com](https://console.anthropic.com/) → API keys |
+| `GROQ_API_KEY` | Free tier (rate-limited) | Pay-per-token after | [console.groq.com/keys](https://console.groq.com/keys) → Create API key |
 | Ollama (local) | Free — runs on your hardware | Free | Install [ollama.ai](https://ollama.ai/), no key needed for local |
 | `OLLAMA_API_KEY` | — | Paid (Ollama Cloud only) | [ollama.ai](https://ollama.ai/) — only needed for Ollama Cloud, not local |
 | `PEXELS_API_KEY` | Free, unlimited | Free | [pexels.com/api](https://www.pexels.com/api/) → Get free API key |
@@ -59,7 +60,7 @@ Task creation returns in <100 ms. The worker handles the heavy video work asynch
 
 **Minimum to get started**: `ASSEMBLY_AI_API_KEY` + one LLM key. Everything else is optional.
 
-**Recommended free stack**: AssemblyAI (free tier) + Google Gemini via AI Studio (free quota) + Pexels (free). Zero cost for light personal use.
+**Recommended free stack**: AssemblyAI (free tier) + Groq (free tier, `groq:llama-3.3-70b-versatile`) or Google Gemini via AI Studio (free quota) + Pexels (free). Zero cost for light personal use. igedits ships a Redis-backed rate limiter (`LLM_MAX_RPM` / `LLM_MAX_RPS` / `LLM_MAX_TPM`) that keeps requests under the free-tier thresholds so you don't hit 429s.
 
 ### 1. Clone
 
@@ -77,14 +78,21 @@ Start from this minimal working config:
 ASSEMBLY_AI_API_KEY=your_assemblyai_key
 
 # ── Required: LLM provider (pick ONE) ─────────────────────
-LLM=google-gla:gemini-2.0-flash
-GOOGLE_API_KEY=your_google_key
+LLM=groq:llama-3.3-70b-versatile
+GROQ_API_KEY=your_groq_key
+# LLM=google-gla:gemini-2.0-flash
+# GOOGLE_API_KEY=...
 # LLM=openai:gpt-5.2
 # OPENAI_API_KEY=...
 # LLM=anthropic:claude-4-sonnet
 # ANTHROPIC_API_KEY=...
 # LLM=ollama:gpt-oss:20b
 # OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+
+# ── Optional: LLM rate limiting (defaults shown, tuned for Groq free tier) ──
+# LLM_MAX_RPM=25        # requests/minute (0 disables)
+# LLM_MAX_RPS=1         # requests/second (0 disables)
+# LLM_MAX_TPM=10000     # tokens/minute   (0 disables)
 
 # ── Required in production ────────────────────────────────
 BETTER_AUTH_SECRET=change_me_to_a_long_random_string
